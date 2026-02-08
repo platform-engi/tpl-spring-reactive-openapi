@@ -1,6 +1,6 @@
 openapi: 3.0.3
 info:
-  title: __SERVICE_NAME__
+  title: {{cookiecutter.service_name}}
   version: 0.1.0
 paths:
   /health:
