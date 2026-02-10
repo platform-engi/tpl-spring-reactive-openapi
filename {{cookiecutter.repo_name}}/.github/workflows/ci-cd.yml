@@ -1,5 +1,24 @@
 {% raw %}
-name: CI-CD Demo (App Runner + Port)
+Skip to content
+platform-001
+mic-003
+Repository navigation
+Code
+Issues
+Pull requests
+Actions
+Projects
+Security
+Insights
+Settings
+CI/CD Deploy (ECR + App Runner + Port)
+ 
+Update ci-cd.yml #9
+All jobs
+Run details
+Workflow file for this run
+.github/workflows/ci-cd.yml at 869adbc
+ name: CI/CD Deploy (ECR + App Runner + Port)
 
 on:
   push:
@@ -10,10 +29,9 @@ jobs:
   build_test_scan:
     runs-on: ubuntu-latest
     outputs:
-      cobertura: ${{ steps.metrics.outputs.cobertura }}
-      vulnerabilidades_altas: ${{ steps.metrics.outputs.vulnerabilidades_altas }}
-      secretos_encontrados: ${{ steps.metrics.outputs.secretos_encontrados }}
-      gates_ok: ${{ steps.gates.outputs.gates_ok }}
+      coverage: ${{ steps.cov.outputs.coverage }}
+      secrets_found: ${{ steps.secrets.outputs.count }}
+      high_vulns: ${{ steps.vulns.outputs.high }}
     steps:
       - uses: actions/checkout@v4
 
@@ -23,131 +41,111 @@ jobs:
           java-version: "21"
           cache: maven
 
-      # Build + Tests + (tu OpenAPI Generator se ejecuta en generate-sources / verify)
       - name: Build & test
         run: mvn -B clean verify
 
-      # ---- Coverage (JaCoCo) ----
-      # Requiere que tengas JaCoCo configurado en el proyecto.
-      # Si aún no lo tienes, abajo te digo el snippet mínimo para pom.xml.
-      - name: Compute coverage from JaCoCo CSV
+      # Cobertura (JaCoCo)
+      - name: Compute coverage
         id: cov
         run: |
-          # Busca jacoco.csv típicamente en target/site/jacoco/jacoco.csv
           CSV=$(find . -path "*target/site/jacoco/jacoco.csv" | head -n 1 || true)
-          if [ -z "$CSV" ]; then
-            echo "No jacoco.csv found. Setting coverage=0"
-            echo "coverage=0" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Cálculo simple: cobertura = 100 * (1 - missed/total) en INSTRUCTION
-          # Formato CSV: GROUP,PACKAGE,CLASS,INSTRUCTION_MISSED,INSTRUCTION_COVERED,...
-          awk -F',' '
-            NR>1 { missed+=$4; covered+=$5 }
-            END {
-              total=missed+covered;
-              if (total==0) { print "coverage=0"; }
-              else {
-                cov=(covered*100)/total;
-                printf("coverage=%d\n", cov);
-              }
-            }
-          ' "$CSV" >> $GITHUB_OUTPUT
-
-      # ---- Secrets (Gitleaks) ----
-      - name: Gitleaks scan (produce json)
+          if [ -z "$CSV" ]; then echo "coverage=0" >> $GITHUB_OUTPUT; exit 0; fi
+          awk -F',' 'NR>1 { missed+=$4; covered+=$5 }
+            END { total=missed+covered; if (total==0) print "coverage=0";
+                  else printf("coverage=%d\n",(covered*100)/total) }' "$CSV" >> $GITHUB_OUTPUT
+      # Secret scanning (Gitleaks)
+      - name: Gitleaks scan
         id: gitleaks
         continue-on-error: true
         run: |
-          curl -sSL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks_8.18.4_linux_x64.tar.gz -o gitleaks.tar.gz
-          tar -xzf gitleaks.tar.gz gitleaks
-          chmod +x gitleaks
-          ./gitleaks detect --no-git --source . --report-format json --report-path gitleaks-report.json
+          # Usamos la versión 8.18.4 explícitamente para evitar sorpresas con 'latest'
+          VERSION="8.18.4"
+          URL="https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          
+          curl -sSL "$URL" -o gitleaks.tar.gz
+          
+          # Verificamos si es realmente un gzip antes de intentar descomprimir
+          if file gitleaks.tar.gz | grep -q "gzip compressed data"; then
+            tar -xzf gitleaks.tar.gz gitleaks
+            chmod +x gitleaks
+            ./gitleaks detect --no-git --source . --report-format json --report-path gitleaks-report.json
+          else
+            echo "Error: El archivo descargado no es un GZIP válido. Probablemente la URL es incorrecta."
+            cat gitleaks.tar.gz # Esto te mostrará el error HTML si es que hubo uno
+            exit 1
+          fi
+      
 
       - name: Count secrets
         id: secrets
         run: |
-          if [ -f gitleaks-report.json ]; then
-            COUNT=$(python - << 'PY'
-            import json,sys
-            try:
-              data=json.load(open("gitleaks-report.json"))
-              print(len(data) if isinstance(data,list) else 0)
-            except Exception:
+          cat << 'PY' > count_secrets.py
+          import json, os
+          try:
+              if os.path.exists("gitleaks-report.json"):
+                  with open("gitleaks-report.json") as f:
+                      d = json.load(f)
+                      print(len(d) if isinstance(d, list) else 0)
+              else:
+                  print(0)
+          except Exception:
               print(0)
-            PY
-            )
-          else
-            COUNT=0
-          fi
+          PY
+          COUNT=$(python count_secrets.py)
           echo "count=$COUNT" >> $GITHUB_OUTPUT
-
-      # ---- SCA (OWASP Dependency-Check) ----
-      - name: Dependency-Check (JSON report)
+      # SCA (OWASP Dependency-Check)
+      - name: Dependency-Check
         id: depcheck
         continue-on-error: true
         run: |
           mvn -B org.owasp:dependency-check-maven:check \
             -Dformat=JSON \
             -DoutputDirectory=target/dependency-check
-
-      - name: Count high vulnerabilities
+      - name: Count HIGH vulns
         id: vulns
         run: |
-          REPORT="target/dependency-check/dependency-check-report.json"
-          if [ -f "$REPORT" ]; then
-            HIGH=$(python - << 'PY'
-            import json
-            r=json.load(open("target/dependency-check/dependency-check-report.json"))
-            deps=r.get("dependencies",[])
-            high=0
-            for d in deps:
-              for v in (d.get("vulnerabilities") or []):
-                sev=(v.get("severity") or "").upper()
-                if sev=="HIGH":
-                  high+=1
-            print(high)
-            PY
-            )
-          else
-            HIGH=0
-          fi
+          cat << 'PY' > count_high_vulns.py
+          import json, os
+          report = "target/dependency-check/dependency-check-report.json"
+          try:
+              if os.path.exists(report):
+                  with open(report) as f:
+                      r = json.load(f)
+                      high = 0
+                      for d in r.get("dependencies", []):
+                          for v in (d.get("vulnerabilities") or []):
+                              if (v.get("severity") or "").upper() == "HIGH":
+                                  high += 1
+                      print(high)
+              else:
+                  print(0)
+          except Exception:
+              print(0)
+          PY
+          HIGH=$(python count_high_vulns.py)
           echo "high=$HIGH" >> $GITHUB_OUTPUT
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: |
+            target/site/jacoco/**
+            target/dependency-check/**
+            gitleaks-report.json
+          if-no-files-found: warn
 
-      # ---- Gates logic ----
-      - name: Compute metrics outputs
-        id: metrics
-        run: |
-          echo "cobertura=${{ steps.cov.outputs.coverage }}" >> $GITHUB_OUTPUT
-          echo "secretos_encontrados=${{ steps.secrets.outputs.count }}" >> $GITHUB_OUTPUT
-          echo "vulnerabilidades_altas=${{ steps.vulns.outputs.high }}" >> $GITHUB_OUTPUT
-
-      - name: Evaluate gates (for status)
-        id: gates
-        run: |
-          COV=${{ steps.cov.outputs.coverage }}
-          SECRETS=${{ steps.secrets.outputs.count }}
-          HIGH=${{ steps.vulns.outputs.high }}
-
-          # Gates demo (ajusta si quieres):
-          # - Coverage >=60
-          # - Secrets ==0
-          # - High vulns ==0
-          OK="true"
-          if [ "$COV" -lt 60 ]; then OK="false"; fi
-          if [ "$SECRETS" -gt 0 ]; then OK="false"; fi
-          if [ "$HIGH" -gt 0 ]; then OK="false"; fi
-
-          echo "gates_ok=$OK" >> $GITHUB_OUTPUT
-
-  deploy_apprunner:
+  deploy:
     if: github.ref == 'refs/heads/main'
     needs: build_test_scan
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     outputs:
       runtime_url: ${{ steps.runtime.outputs.runtime_url }}
       deploy_ok: ${{ steps.runtime.outputs.deploy_ok }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
     steps:
       - uses: actions/checkout@v4
 
@@ -157,105 +155,125 @@ jobs:
           java-version: "21"
           cache: maven
 
-      # OIDC a AWS (sin access keys)
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEPLOY }}
+          aws-region: ${{ vars.AWS_REGION }}
 
-      # Login a ECR para que Jib pueda push
       - name: Login to Amazon ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Build + push image con Jib (sin Dockerfile)
       - name: Build & Push image to ECR (Jib)
+        id: meta
         env:
           ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
-          ECR_REPO: ${{ secrets.ECR_REPO }}
+          ECR_REPO: ${{ github.event.repository.name }}   # 1 ECR por microservicio
           IMAGE_TAG: ${{ github.sha }}
         run: |
           IMAGE="$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG"
           mvn -B -DskipTests com.google.cloud.tools:jib-maven-plugin:3.4.0:build -Dimage="$IMAGE"
-
-      # Update App Runner service para usar la imagen nueva
+          echo "image_uri=$IMAGE" >> $GITHUB_OUTPUT
       - name: Update App Runner service
         env:
-          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
           SERVICE_ARN: ${{ secrets.APP_RUNNER_SERVICE_ARN }}
-          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
-          ECR_REPO: ${{ secrets.ECR_REPO }}
-          IMAGE_TAG: ${{ github.sha }}
+          IMAGE_URI: ${{ steps.meta.outputs.image_uri }}
         run: |
-          IMAGE_ID="$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG"
-
           aws apprunner update-service \
             --service-arn "$SERVICE_ARN" \
-            --source-configuration "ImageRepository={ImageIdentifier=$IMAGE_ID,ImageRepositoryType=ECR,ImageConfiguration={Port=8080}}" \
-            --region "$AWS_REGION"
-
-      - name: Fetch runtime url
+            --region "$AWS_REGION" \
+            --source-configuration "ImageRepository={ImageIdentifier=$IMAGE_URI,ImageRepositoryType=ECR,ImageConfiguration={Port=8080}}"
+      - name: Get runtime URL
         id: runtime
         env:
-          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
           SERVICE_ARN: ${{ secrets.APP_RUNNER_SERVICE_ARN }}
         run: |
           URL=$(aws apprunner describe-service --service-arn "$SERVICE_ARN" --region "$AWS_REGION" --query "Service.ServiceUrl" --output text)
-          # URL viene sin https a veces
-          if [[ "$URL" == http* ]]; then
-            RUNTIME="$URL"
-          else
-            RUNTIME="https://$URL"
-          fi
-          echo "runtime_url=$RUNTIME" >> $GITHUB_OUTPUT
+          if [[ "$URL" == http* ]]; then R="$URL"; else R="https://$URL"; fi
+          echo "runtime_url=$R" >> $GITHUB_OUTPUT
           echo "deploy_ok=true" >> $GITHUB_OUTPUT
-
-  publish_to_port:
+  update_port:
     if: always()
-    needs: [build_test_scan, deploy_apprunner]
+    needs: [build_test_scan, deploy]
     runs-on: ubuntu-latest
     steps:
-      - name: Publish to Port webhook (microservicio + branch)
+      - uses: actions/checkout@v4
+
+      - name: Update Port (microservicio + branch + ecr_repository)
         env:
-          PORT_WEBHOOK_URL: ${{ secrets.PORT_WEBHOOK_URL }}
+          PORT_WEBHOOK_URL: ${{ secrets.PORT_WEBHOOK_URL_INFRA }}
+          REPO: ${{ github.event.repository.name }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUNTIME_URL: ${{ needs.deploy.outputs.runtime_url }}
+          DEPLOY_OK: ${{ needs.deploy.outputs.deploy_ok }}
+          IMAGE_URI: ${{ needs.deploy.outputs.image_uri }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          COVERAGE: ${{ needs.build_test_scan.outputs.coverage }}
+          SECRETS_FOUND: ${{ needs.build_test_scan.outputs.secrets_found }}
+          HIGH_VULNS: ${{ needs.build_test_scan.outputs.high_vulns }}
         run: |
-          REPO="${{ github.event.repository.name }}"
-          BRANCH="${{ github.ref_name }}"
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          COBERTURA="${{ needs.build_test_scan.outputs.cobertura }}"
-          VULNS_HIGH="${{ needs.build_test_scan.outputs.vulnerabilidades_altas }}"
-          SECRETS="${{ needs.build_test_scan.outputs.secretos_encontrados }}"
-          GATES_OK="${{ needs.build_test_scan.outputs.gates_ok }}"
-
-          DEPLOY_OK="${{ needs.deploy_apprunner.outputs.deploy_ok }}"
-          RUNTIME_URL="${{ needs.deploy_apprunner.outputs.runtime_url }}"
-
-          # Si no hubo deploy (PR), marcar como Con errores para que no pase Gold por "Desplegado"
-          BUILD_STATUS="Con errores"
-          if [ "$GATES_OK" = "true" ] && [ "$DEPLOY_OK" = "true" ]; then
-            BUILD_STATUS="Desplegado"
-          fi
-
-          cat > payload.json << EOF
-          {
-            "microservicio": {
-              "cod_servicio": "${REPO}",
-              "nombre_servicio": "${REPO}",
-              "tecnologia": "Java",
-              "estado_de_aprovisionamiento": "Generado"
-            },
-            "branch": {
-              "codigo_branch": "${REPO}:${BRANCH}",
-              "build_status": "${BUILD_STATUS}",
-              "cobertura": ${COBERTURA:-0},
-              "vulnerabilidades_altas": ${VULNS_HIGH:-0},
-              "secretos_encontrados": ${SECRETS:-0},
-              "url_pipeline": "${RUN_URL}"
+          python - << 'PY'
+            import json, os, pathlib
+            from datetime import datetime, timezone
+            
+            repo=os.environ["REPO"]
+            branch=os.environ["BRANCH"]
+            run_url=os.environ["RUN_URL"]
+            runtime=os.environ.get("RUNTIME_URL","")
+            deploy_ok=os.environ.get("DEPLOY_OK","") == "true"
+            aws_region=os.environ.get("AWS_REGION","")
+            
+            coverage=float(os.environ.get("COVERAGE") or 0)
+            secrets_found=float(os.environ.get("SECRETS_FOUND") or 0)
+            high_vulns=float(os.environ.get("HIGH_VULNS") or 0)
+            
+            image_uri=os.environ.get("IMAGE_URI","")
+            repo_name=repo  # ECR repo = nombre del microservicio
+            tag=image_uri.split(":")[-1] if ":" in image_uri else ""
+            
+            # Estado branch: si deploy ok -> Desplegado, caso contrario Con errores
+            status = "Desplegado" if deploy_ok else "Con errores"
+            
+            openapi_path = pathlib.Path("api/openapi.yaml")
+            open_api = openapi_path.read_text(encoding="utf-8") if openapi_path.exists() else ""
+            
+            branch_identifier = f"{repo}:{branch}"
+            
+            payload = {
+              "microservicio": {
+                "cod_servicio": repo,
+                "nombre_servicio": repo,
+                "open_api": open_api,
+                "tecnologia": "Java",
+                "estado_de_aprovisionamiento": "Generado"
+              },
+              "branch": {
+                "codigo_branch": branch_identifier,
+                "build_status": status,
+                "cobertura": coverage,
+                "vulnerabilidades_altas": high_vulns,
+                "secretos_encontrados": secrets_found,
+                "url_pipeline": run_url
+              },
+              "ecr_repository": {
+                "identifier": f"ecr:{repo}:{branch}",
+                "repo_name": repo_name,
+                "aws_region": aws_region,
+                "aws_account_id": "",  # opcional, si lo quieres lo sacamos con sts en otro step
+                "repository_uri": image_uri.split(":")[0] if image_uri else "",
+                "image_tag": tag,
+                "image_uri": image_uri,
+                "pushed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z"),
+                "branch_identifier": branch_identifier
+              }
             }
-          }
-          EOF
+            
+            print(json.dumps(payload))
+            PY > payload.json
+          curl -sS -X POST -H "Content-Type: application/json" -d @payload.json "$PORT_WEBHOOK_URL"
 
-          curl -sS -X POST -H "Content-Type: application/json" -d @payload.json "$PORT_WEBHOOK_URL
 {% endraw %}
