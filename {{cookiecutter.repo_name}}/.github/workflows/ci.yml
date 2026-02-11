@@ -1,0 +1,315 @@
+{% raw %}
+name: CI Branch - Security + Quality + Build Image + Port
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "us-east-1"
+        required: true
+        default: "us-east-1"
+      repository_url:
+        description: "123.dkr.ecr.us-east-1...."
+        required: true
+      branch_identifier:
+        description: "identifier of entitie Port"
+        required: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ${{ inputs.aws_region }}
+      ECR_REPO_URL: ${{ inputs.repository_url }}
+      PORT_WEBHOOK_URL: ${{ secrets.PORT_WEBHOOK_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 0) Tag seguro + IMAGE_URI
+      - name: Build tag (branch-safe)
+        id: meta
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          BRANCH_SLUG="$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g')"
+          SHA7="${GITHUB_SHA::7}"
+          TAG="${BRANCH_SLUG}-${SHA7}"
+          echo "branch_slug=$BRANCH_SLUG" >> $GITHUB_OUTPUT
+          echo "sha7=$SHA7" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "IMAGE_URI=${ECR_REPO_URL}:${TAG}" >> $GITHUB_ENV
+          echo "PIPELINE_URL=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >> $GITHUB_ENV
+
+      # 1) Secrets scan (gitleaks) -> JSON
+      - name: Secrets scan (gitleaks json)
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:latest \
+            detect --redact --no-git --report-format json --report-path gitleaks.json || true
+          test -f gitleaks.json || echo "[]" > gitleaks.json
+
+      # 2) Vulnerability scan repo (trivy fs) -> JSON (HIGH/CRITICAL)
+      - name: Vulnerability scan (trivy fs json)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "json"
+          output: "trivy-fs.json"
+          severity: "HIGH,CRITICAL"
+          exit-code: "0"
+
+      # 3) Setup Java + tests (JaCoCo)
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Test + JaCoCo
+        run: mvn -B test
+
+      # 4) AWS auth + ECR login
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEPLOY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 5) Build & push image (Jib)
+      - name: Build & push image (Jib)
+        run: |
+          mvn -B -DskipTests clean compile
+          mvn -B -DskipTests jib:build -Dimage="${IMAGE_URI}"
+
+      # 6) Scan image (trivy image) -> JSON
+      - name: Image scan (trivy image json)
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.IMAGE_URI }}
+          format: "json"
+          output: "trivy-image.json"
+          severity: "HIGH,CRITICAL"
+          exit-code: "0"
+
+      # 7) Compute metrics (secrets/vulns/coverage) + decide build_status
+      - name: Compute metrics
+        id: metrics
+        run: |
+          python - <<'PY'
+          import json, os, csv, glob
+
+          # secrets count (gitleaks)
+          with open("gitleaks.json","r",encoding="utf-8") as f:
+              try:
+                  gl = json.load(f)
+              except:
+                  gl = []
+          secrets = len(gl) if isinstance(gl, list) else 0
+
+          # vulns count (prefer image scan; fallback to fs scan)
+          def count_vulns(path):
+              try:
+                  data = json.load(open(path,"r",encoding="utf-8"))
+              except:
+                  return 0
+              total = 0
+              results = data.get("Results", []) if isinstance(data, dict) else []
+              for r in results:
+                  vulns = r.get("Vulnerabilities", []) or []
+                  for v in vulns:
+                      sev = (v.get("Severity") or "").upper()
+                      if sev in ("HIGH","CRITICAL"):
+                          total += 1
+              return total
+
+          vulns = 0
+          if os.path.exists("trivy-image.json"):
+              vulns = count_vulns("trivy-image.json")
+          if vulns == 0 and os.path.exists("trivy-fs.json"):
+              vulns = count_vulns("trivy-fs.json")
+
+          # coverage from jacoco.csv
+          coverage = 0.0
+          candidates = glob.glob("**/target/site/jacoco/jacoco.csv", recursive=True)
+          if candidates:
+              p = candidates[0]
+              missed = covered = 0
+              with open(p, newline="", encoding="utf-8") as f:
+                  reader = csv.DictReader(f)
+                  for row in reader:
+                      missed += int(row.get("INSTRUCTION_MISSED", 0) or 0)
+                      covered += int(row.get("INSTRUCTION_COVERED", 0) or 0)
+              if missed + covered > 0:
+                  coverage = round((covered/(missed+covered))*100, 2)
+
+          # build_status logic
+          if secrets > 0:
+              status = "Secrets Found"
+          elif vulns > 0:
+              status = "Security Gate Failed"
+          else:
+              status = "Build OK"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"secretos={secrets}\n")
+              f.write(f"vulns_high_critical={vulns}\n")
+              f.write(f"cobertura={coverage}\n")
+              f.write(f"build_status={status}\n")
+          PY
+
+      # 8) Update Port (branch entity) + OpenAPI + Security Findings (Trivy)
+      - name: Update Port (branch) - metrics + image + OpenAPI + security details
+        env:
+          PORT_WEBHOOK_URL: ${{ secrets.PORT_WEBHOOK_URL }}
+          SERVICE_CODE: ${{ github.event.repository.name }}
+          BRANCH: ${{ github.ref_name }}
+          BRANCH_IDENTIFIER: ${{ inputs.branch_identifier }}
+          PIPELINE_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          IMAGE_URI: ${{ env.IMAGE_URI }}
+        run: |
+          OPENAPI_PATH="api/openapi.yaml"
+
+          if [ ! -f "$OPENAPI_PATH" ]; then
+            echo "❌ No encuentro OpenAPI en $OPENAPI_PATH"
+            exit 1
+          fi
+
+          python - <<'PY'
+
+          import json, pathlib, os
+          import glob, csv
+
+          service = os.environ["SERVICE_CODE"]
+          branch = os.environ["BRANCH"]
+          pipeline = os.environ["PIPELINE_URL"]
+          image_uri = os.environ.get("IMAGE_URI", "")
+          branch_identifier = os.environ["BRANCH_IDENTIFIER"]
+
+          secretos = int("${{ steps.metrics.outputs.secretos }}")
+          vulns = int("${{ steps.metrics.outputs.vulns_high_critical }}")
+          cobertura = float("${{ steps.metrics.outputs.cobertura }}")
+          status = "${{ steps.metrics.outputs.build_status }}"
+
+          openapi = pathlib.Path("api/openapi.yaml").read_text(encoding="utf-8")
+
+          # ---- Security Findings (Trivy image json -> markdown) ----
+          def trivy_findings_md(path: str, limit: int = 15) -> str:
+              import os as _os
+              if not _os.path.exists(path):
+                  return "### Vulnerabilidades (Trivy)\n_No hay reporte Trivy de imagen disponible._"
+
+              try:
+                  with open(path, "r", encoding="utf-8") as f:
+                      data = json.load(f)
+              except Exception:
+                  return "### Vulnerabilidades (Trivy)\n_No se pudo leer el reporte Trivy._"
+
+              rows = []
+              for r in data.get("Results", []) or []:
+                  for v in (r.get("Vulnerabilities") or []):
+                      sev = (v.get("Severity") or "").upper()
+                      if sev not in ("HIGH", "CRITICAL"):
+                          continue
+                      rows.append({
+                          "Severity": sev,
+                          "VulnerabilityID": v.get("VulnerabilityID",""),
+                          "PkgName": v.get("PkgName",""),
+                          "InstalledVersion": v.get("InstalledVersion",""),
+                          "FixedVersion": v.get("FixedVersion","") or "-",
+                      })
+
+              order = {"CRITICAL": 0, "HIGH": 1}
+              rows.sort(key=lambda x: (order.get(x["Severity"], 9), x["VulnerabilityID"], x["PkgName"]))
+
+              md = [f"### Vulnerabilidades (Trivy) – HIGH/CRITICAL: *{len(rows)}*"]
+              if not rows:
+                  md.append("✅ No se detectaron vulnerabilidades HIGH/CRITICAL.")
+                  return "\n".join(md)
+
+              md.append("")
+              md.append("| Severidad | ID | Paquete | Instalada | Fix |")
+              md.append("|---|---|---|---|---|")
+              for item in rows[:limit]:
+                  md.append(f"| {item['Severity']} | {item['VulnerabilityID']} | {item['PkgName']} | {item['InstalledVersion']} | {item['FixedVersion']} |")
+
+              if len(rows) > limit:
+                  md.append(f"\n_Mostrando top {limit}. Total: {len(rows)}._")
+
+              return "\n".join(md)
+
+          def jacoco_markdown(limit: int = 10) -> str:
+              candidates = glob.glob("**/target/site/jacoco/jacoco.csv", recursive=True)
+              if not candidates:
+                  return "### Cobertura (JaCoCo)\n_No se encontró jacoco.csv._"
+
+              p = candidates[0]
+              rows = []
+              missed = covered = 0
+
+              with open(p, newline="", encoding="utf-8") as f:
+                  reader = csv.DictReader(f)
+                  for r in reader:
+                      m = int(r.get("INSTRUCTION_MISSED", 0) or 0)
+                      c = int(r.get("INSTRUCTION_COVERED", 0) or 0)
+                      missed += m
+                      covered += c
+                      pkg = r.get("PACKAGE", "")
+                      cls = r.get("CLASS", "")
+                      denom = m + c
+                      pct = (c / denom * 100.0) if denom else 0.0
+                      rows.append((pct, pkg, cls, m, c))
+
+              total = round((covered/(missed+covered))*100, 2) if (missed+covered) else 0.0
+              rows.sort(key=lambda x: x[0])
+
+              md = [f"### Cobertura (JaCoCo)\n**Total instrucciones:** {total}%", ""]
+              md.append(f"**Top {min(limit, len(rows))} clases con menor cobertura:**")
+              md.append("")
+              md.append("| Cobertura | Paquete | Clase | Missed | Covered |")
+              md.append("|---:|---|---|---:|---:|")
+
+              for pct, pkg, cls, m, c in rows[:limit]:
+                  md.append(f"| {pct:.2f}% | `{pkg}` | `{cls}` | {m} | {c} |")
+
+              return "\n".join(md)
+
+          quality_findings = jacoco_markdown(limit=10)
+          security_findings = trivy_findings_md("trivy-image.json", limit=15)
+
+          payload = {
+              "identifier": branch_identifier,
+              "blueprint": "branch",
+              "properties": {
+                  "codigo_branch": branch,
+                  "build_status": status,
+                  "secretos_encontrados": secretos,
+                  "vulnerabilidades_altas": vulns,
+                  "cobertura": cobertura,
+                  "url_pipeline": pipeline,
+                  "image_uri": image_uri,
+                  "open_api": openapi,
+                  "security_findings": security_findings,
+                  "quality_findings": quality_findings
+              }
+          }
+
+          with open("payload.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, ensure_ascii=False)
+          PY
+       
+
+          curl -sS -X POST "$PORT_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d @payload.json
+{% endraw %}

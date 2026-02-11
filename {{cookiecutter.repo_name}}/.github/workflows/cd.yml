@@ -1,0 +1,170 @@
+{% raw %}
+name: CD Branch - Deploy App Runner + Port
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "us-east-1"
+        required: true
+        default: "us-east-1"
+      repository_url:
+        description: "ECR repo URL (ej: 123.dkr.ecr.us-east-1.amazonaws.com/micro-07-micro-07-main)"
+        required: true
+      branch_identifier:
+        description: "identifier of Port branch entity"
+        required: true
+      apprunner_service_name:
+        description: "Opcional: nombre del App Runner service (si no, usa el nombre del repo GitHub)"
+        required: false
+      image_tag:
+        description: "Opcional: tag exacto a desplegar (si vacío, usa <branch>-<sha7>)"
+        required: false
+
+jobs:
+  cd:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ${{ inputs.aws_region }}
+      ECR_REPO_URL: ${{ inputs.repository_url }}
+      PORT_WEBHOOK_URL: ${{ secrets.PORT_WEBHOOK_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 0) Tag seguro + IMAGE_URI (mismo criterio que CI)
+      - name: Build tag (branch-safe)
+        id: meta
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          BRANCH_SLUG="$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g')"
+          SHA7="${GITHUB_SHA::7}"
+
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            TAG="${{ inputs.image_tag }}"
+          else
+            TAG="${BRANCH_SLUG}-${SHA7}"
+          fi
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "IMAGE_URI=${ECR_REPO_URL}:${TAG}" >> $GITHUB_ENV
+          echo "PIPELINE_URL=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >> $GITHUB_ENV
+
+          echo "Using IMAGE_URI=${ECR_REPO_URL}:${TAG}"
+
+      # 1) AWS auth
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEPLOY }}
+          aws-region: ${{ inputs.aws_region }}
+
+      # 2) Resolver App Runner ARN (sin guardarlo manual)
+      - name: Resolve App Runner ARN
+        id: apprunner
+        run: |
+          if [ -n "${{ inputs.apprunner_service_name }}" ]; then
+            SERVICE_NAME="${{ inputs.apprunner_service_name }}"
+          else
+            SERVICE_NAME="${GITHUB_REPOSITORY##*/}"
+          fi
+
+          echo "Looking for App Runner service: $SERVICE_NAME"
+
+          ARN=$(aws apprunner list-services \
+            --region "$AWS_REGION" \
+            --query "ServiceSummaryList[?ServiceName=='$SERVICE_NAME'].ServiceArn" \
+            --output text)
+
+          if [ -z "$ARN" ] || [ "$ARN" = "None" ]; then
+            echo "❌ No App Runner service found with name: $SERVICE_NAME"
+            echo "Tip: crea el App Runner una vez (workflow de create-service o manual) con ese serviceName."
+            exit 1
+          fi
+
+          echo "service_arn=$ARN" >> $GITHUB_OUTPUT
+          echo "Found ARN: $ARN"
+
+      # 3) Deploy (update-service)
+      - name: Deploy to App Runner
+        run: |
+          aws apprunner update-service \
+            --service-arn "${{ steps.apprunner.outputs.service_arn }}" \
+            --region "$AWS_REGION" \
+            --source-configuration "ImageRepository={ImageIdentifier=${IMAGE_URI},ImageRepositoryType=ECR,ImageConfiguration={Port=8080}}"
+
+      # 4) Esperar a RUNNING y obtener URL
+      - name: Wait until RUNNING + Get Service URL
+        id: url
+        run: |
+          ARN="${{ steps.apprunner.outputs.service_arn }}"
+          MAX_SEC=900   # 15 min
+          STEP=15
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $MAX_SEC ]; do
+            STATUS=$(aws apprunner describe-service --region "$AWS_REGION" --service-arn "$ARN" --query "Service.Status" --output text)
+            URL=$(aws apprunner describe-service --region "$AWS_REGION" --service-arn "$ARN" --query "Service.ServiceUrl" --output text || true)
+
+            echo "Status=$STATUS | Url=$URL | elapsed=${ELAPSED}s"
+
+            if [ "$STATUS" = "RUNNING" ]; then
+              echo "service_url=$URL" >> $GITHUB_OUTPUT
+              echo "✅ RUNNING: $URL"
+              exit 0
+            fi
+
+            if [ "$STATUS" = "OPERATION_FAILED" ] || [ "$STATUS" = "UPDATE_FAILED" ] || [ "$STATUS" = "CREATE_FAILED" ]; then
+              echo "❌ Deploy failed: $STATUS"
+              aws apprunner describe-service --region "$AWS_REGION" --service-arn "$ARN" --output json
+              exit 1
+            fi
+
+            sleep $STEP
+            ELAPSED=$((ELAPSED+STEP))
+          done
+
+          echo "❌ Timeout waiting for RUNNING"
+          aws apprunner describe-service --region "$AWS_REGION" --service-arn "$ARN" --output json
+          exit 1
+
+      # 5) Update Port (branch entity) - deploy info
+      - name: Update Port (branch) - deploy status + service url
+        env:
+          SERVICE_CODE: ${{ github.event.repository.name }}
+          BRANCH: ${{ github.ref_name }}
+          BRANCH_IDENTIFIER: ${{ inputs.branch_identifier }}
+          PIPELINE_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          IMAGE_URI: ${{ env.IMAGE_URI }}
+          SERVICE_URL: ${{ steps.url.outputs.service_url }}
+        run: |
+          python - <<'PY'
+          import json, os
+
+          branch_identifier = os.environ["BRANCH_IDENTIFIER"]
+          branch = os.environ["BRANCH"]
+
+          payload = {
+              "identifier": branch_identifier,
+              "blueprint": "branch",
+              "properties": {
+                  "codigo_branch": branch,
+                  "build_status": "Desplegado",
+                  "url_pipeline": os.environ["PIPELINE_URL"],
+                  "image_uri": os.environ.get("IMAGE_URI",""),
+                  "url_servicio": os.environ.get("SERVICE_URL","")
+              }
+          }
+
+          with open("payload.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, ensure_ascii=False)
+          PY
+
+          curl -sS -X POST "$PORT_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d @payload.json
+{% endraw %}
